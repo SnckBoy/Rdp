@@ -1,0 +1,603 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Restore Saved Data
+        run: |
+          $dir  = "C:\RDPData"
+          $repo = $env:GITHUB_REPOSITORY
+          $tar  = "$env:SystemRoot\System32\tar.exe"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          foreach ($f in "Desktop","Documents","Downloads","Pictures","Videos","Music") {
+              New-Item -ItemType Directory -Force -Path "$dir\$f" | Out-Null
+          }
+
+          # Save script (loop aur last step dono yahi use karte hain)
+          @'
+          $ErrorActionPreference = "Continue"
+          $tar = "$env:SystemRoot\System32\tar.exe"
+          $d = "$env:TEMP\save"
+          New-Item -ItemType Directory -Force -Path $d | Out-Null
+
+          # RDP user ka asli profile path (registry se)
+          $prof = $null
+          $sid = $null
+          try {
+              $sid = (Get-LocalUser -Name "RDP").SID.Value
+              $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+          } catch {}
+          if (-not $prof) { $prof = "C:\Users\RDP" }
+          Write-Host "Profile path: $prof"
+
+          function Save-Archive($name, $baseDir, $sources, $excludes) {
+              $f = "$d\$name"
+              Remove-Item $f -Force -ErrorAction SilentlyContinue
+              $a = @("-czf", $f) + $excludes + @("-C", $baseDir) + $sources
+              & $tar @a
+              if (Test-Path $f) {
+                  $mb = [math]::Round((Get-Item $f).Length / 1MB)
+                  if ($mb -gt 1900) { Write-Host "$name $mb MB hai, 2 GB limit ke paas, save skip"; return }
+                  gh release upload rdp-data $f --repo $env:GITHUB_REPOSITORY --clobber
+                  Write-Host "[$(Get-Date)] $name saved ($mb MB)"
+              } else {
+                  Write-Host "$name ban hi nahi paya"
+              }
+          }
+
+          # Wallpaper save (image + settings) - data.tgz se pehle
+          try {
+              $wpDir = "C:\RDPData\wallpaper"
+              New-Item -ItemType Directory -Force -Path $wpDir | Out-Null
+              $cur = $null; $style = "10"; $tile = "0"
+              if ($sid) {
+                  $hk = "Registry::HKEY_USERS\$sid\Control Panel\Desktop"
+                  if (Test-Path $hk) {
+                      $dp = Get-ItemProperty $hk
+                      $cur = $dp.Wallpaper
+                      if ($dp.WallpaperStyle) { $style = "$($dp.WallpaperStyle)" }
+                      if ($dp.TileWallpaper) { $tile = "$($dp.TileWallpaper)" }
+                  }
+              }
+              if (-not $cur -or -not (Test-Path $cur)) { $cur = "$prof\AppData\Roaming\Microsoft\Windows\Themes\TranscodedWallpaper" }
+              if (Test-Path $cur) {
+                  $ext = [IO.Path]::GetExtension($cur); if (-not $ext) { $ext = ".jpg" }
+                  $dest = "$wpDir\wall$ext"
+                  if ($cur -ne $dest) {
+                      Get-ChildItem $wpDir -Filter "wall.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                      Copy-Item $cur $dest -Force
+                  }
+                  @{ style = $style; tile = $tile } | ConvertTo-Json | Set-Content "$wpDir\settings.json"
+                  Write-Host "Wallpaper saved: $cur"
+              } else { Write-Host "Wallpaper file nahi mili, purana saved wallpaper rakha" }
+          } catch { Write-Host "Wallpaper save fail: $_" }
+
+          # 1) Desktop, Documents, Downloads, apps.txt etc.
+          Save-Archive "data.tgz" "C:\RDPData" @(".") @()
+
+          # 2) Browsers (har browser ka alag archive, taaki kabhi skip na ho)
+          $exB = @("--exclude=*Cache*", "--exclude=*cache*", "--exclude=Crashpad", "--exclude=GrShaderCache", "--exclude=ShaderCache")
+          $browsers = @(
+              @{ n = "edge.tgz";    p = @("AppData/Local/Microsoft/Edge") },
+              @{ n = "chrome.tgz";  p = @("AppData/Local/Google/Chrome") },
+              @{ n = "brave.tgz";   p = @("AppData/Local/BraveSoftware") },
+              @{ n = "firefox.tgz"; p = @("AppData/Roaming/Mozilla", "AppData/Local/Mozilla") }
+          )
+          foreach ($b in $browsers) {
+              $have = @($b.p | Where-Object { Test-Path ("$prof\" + ($_ -replace "/", "\")) })
+              if ($have.Count -gt 0) { Save-Archive $b.n $prof $have $exB }
+              else { Write-Host "$($b.n): browser data nahi mila, skip" }
+          }
+
+          # 3) Baaki AppData + VS Code / Codex / Antigravity home-folder data
+          if (Test-Path "$prof\AppData") {
+              $ex = @(
+                  "--exclude=AppData/Local/Temp",
+                  "--exclude=AppData/Local/Packages",
+                  "--exclude=AppData/Local/Microsoft/Windows",
+                  "--exclude=AppData/Local/Microsoft/Edge",
+                  "--exclude=AppData/Local/Google/Chrome",
+                  "--exclude=AppData/Local/BraveSoftware",
+                  "--exclude=AppData/Roaming/Mozilla",
+                  "--exclude=AppData/Local/Mozilla",
+                  "--exclude=AppData/Roaming/Microsoft/Windows",
+                  "--exclude=AppData/Roaming/.minecraft/assets",
+                  "--exclude=AppData/Roaming/.minecraft/libraries",
+                  "--exclude=AppData/Roaming/.minecraft/runtime",
+                  "--exclude=AppData/Roaming/.minecraft/logs",
+                  "--exclude=AppData/Roaming/.minecraft/webcache",
+                  "--exclude=*Cache*",
+                  "--exclude=*cache*"
+              )
+              $src = @("AppData")
+              foreach ($x in ".vscode", ".codex", ".antigravity", ".gemini") {
+                  if (Test-Path "$prof\$x") { $src += $x }
+              }
+              Save-Archive "appdata.tgz" $prof $src $ex
+          }
+          # 4) Codex app + ChatGPT app (Store apps ka data Packages folder me hota hai)
+          $pk = Get-ChildItem "$prof\AppData\Local\Packages" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "OpenAI.Codex*" -or $_.Name -like "OpenAI.ChatGPT*" }
+          if ($pk) {
+              $src2 = @($pk | ForEach-Object { "AppData/Local/Packages/$($_.Name)" })
+              Save-Archive "chatgpt.tgz" $prof $src2 @("--exclude=TempState", "--exclude=AC", "--exclude=GPUCache", "--exclude=Code Cache", "--exclude=Cache", "--exclude=Crashpad")
+          } else {
+              Write-Host "Codex/ChatGPT Store app data nahi mila, skip"
+          }
+          exit 0
+          '@ | Set-Content -Path "C:\save-data.ps1"
+
+          # Desktop, Documents, Downloads, Pictures, Videos, Music ko C:\RDPData me redirect karo
+          # (Default profile me, taaki RDP user ke pehle login se hi apply ho)
+          reg load HKU\DefTmp "C:\Users\Default\NTUSER.DAT" | Out-Null
+          $k = "Registry::HKEY_USERS\DefTmp\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+          if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
+          $map = @{
+              "Desktop" = "Desktop"
+              "Personal" = "Documents"
+              "{374DE290-123F-4565-9164-39C4925E467B}" = "Downloads"
+              "My Pictures" = "Pictures"
+              "My Video" = "Videos"
+              "My Music" = "Music"
+          }
+          foreach ($n in $map.Keys) {
+              Set-ItemProperty -Path $k -Name $n -Value "$dir\$($map[$n])" -Type ExpandString
+          }
+          [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefTmp | Out-Null
+
+          # Purana data restore
+          gh release view rdp-data --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+              gh release create rdp-data --repo $repo --title "RDP data" --notes "Saved RDP data. Delete mat karna."
+              Write-Host "Pehli baar run hai, purana data nahi hai."
+          } else {
+              gh release download rdp-data --repo $repo --pattern data.tgz --dir $env:TEMP --clobber
+              if (Test-Path "$env:TEMP\data.tgz") {
+                  & $tar -xzf "$env:TEMP\data.tgz" -C $dir
+                  Write-Host "Purana data restore ho gaya."
+              } else {
+                  # purane version ka data.zip ho to wo bhi le lo
+                  gh release download rdp-data --repo $repo --pattern data.zip --dir $env:TEMP --clobber
+                  if (Test-Path "$env:TEMP\data.zip") {
+                      Expand-Archive "$env:TEMP\data.zip" -DestinationPath $dir -Force
+                      Write-Host "Purana data.zip restore ho gaya."
+                  } else {
+                      Write-Host "Abhi tak koi data save nahi hua."
+                  }
+              }
+          }
+          exit 0
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          # Har run me same password (Windows encryption / saved login ke liye zaroori)
+          gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern rdp-pass.txt --dir $env:TEMP --clobber 2>$null
+          if (Test-Path "$env:TEMP\rdp-pass.txt") {
+              $password = (Get-Content "$env:TEMP\rdp-pass.txt" -Raw).Trim()
+          } else {
+              Set-Content -Path "$env:TEMP\rdp-pass.txt" -Value $password -NoNewline
+              gh release upload rdp-data "$env:TEMP\rdp-pass.txt" --repo $env:GITHUB_REPOSITORY --clobber
+          }
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Create Profile and Restore App Data
+        run: |
+          # RDP user ka profile pehle hi bana do, taaki AppData restore ho sake
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class UserProf {
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+              public static extern int CreateProfile(
+                  [MarshalAs(UnmanagedType.LPWStr)] string pszUserSid,
+                  [MarshalAs(UnmanagedType.LPWStr)] string pszUserName,
+                  [Out][MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszProfilePath,
+                  uint cchProfilePath);
+          }
+          "@
+          $sid = (Get-LocalUser -Name "RDP").SID.Value
+          Write-Host "RDP user SID: $sid"
+          gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern last-sid.txt --dir $env:TEMP --clobber 2>$null
+          if (Test-Path "$env:TEMP\last-sid.txt") {
+              $oldSid = (Get-Content "$env:TEMP\last-sid.txt" -Raw).Trim()
+              if ($oldSid -eq $sid) { Write-Host "SID SAME HAI: saved login (Chrome/VS Code) chal sakte hain" }
+              else { Write-Host "SID BADLA (purana $oldSid): Windows-encrypted login is machine par nahi chalega" }
+          }
+          Set-Content -Path "$env:TEMP\last-sid.txt" -Value $sid -NoNewline
+          gh release upload rdp-data "$env:TEMP\last-sid.txt" --repo $env:GITHUB_REPOSITORY --clobber
+          $sb  = New-Object System.Text.StringBuilder 260
+          $hr  = [UserProf]::CreateProfile($sid, "RDP", $sb, 260)
+          Write-Host "CreateProfile result: $hr  path: $sb"
+
+          $prof = $null
+          try {
+              $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+          } catch {}
+          if (-not $prof) {
+              Write-Host "PROFILE NAHI BANA - AppData restore skip (varna login par galat profile ban sakta hai)"
+              exit 0
+          }
+          Write-Host "Profile path: $prof"
+
+          $tar = "$env:SystemRoot\System32\tar.exe"
+          foreach ($name in "appdata.tgz", "edge.tgz", "chrome.tgz", "brave.tgz", "firefox.tgz") {
+              gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern $name --dir $env:TEMP --clobber
+              if (Test-Path "$env:TEMP\$name") {
+                  & $tar -xzf "$env:TEMP\$name" -C $prof
+                  Write-Host "$name restore ho gaya."
+              } else {
+                  Write-Host "$name abhi tak save nahi hua."
+              }
+          }
+          # Wallpaper restore (RDP user ke registry hive me set karo)
+          try {
+              $wp = Get-ChildItem "C:\RDPData\wallpaper" -Filter "wall.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+              $hive = "$prof\NTUSER.DAT"
+              if ($wp -and (Test-Path $hive)) {
+                  $style = "10"; $tile = "0"
+                  if (Test-Path "C:\RDPData\wallpaper\settings.json") {
+                      $j = Get-Content "C:\RDPData\wallpaper\settings.json" -Raw | ConvertFrom-Json
+                      if ($j.style) { $style = "$($j.style)" }
+                      if ($j.tile) { $tile = "$($j.tile)" }
+                  }
+                  reg load HKU\RdpWall "$hive" | Out-Null
+                  $k = "Registry::HKEY_USERS\RdpWall\Control Panel\Desktop"
+                  Set-ItemProperty -Path $k -Name Wallpaper -Value $wp.FullName
+                  Set-ItemProperty -Path $k -Name WallpaperStyle -Value $style
+                  Set-ItemProperty -Path $k -Name TileWallpaper -Value $tile
+                  [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                  Start-Sleep -Seconds 2
+                  reg unload HKU\RdpWall | Out-Null
+                  Write-Host "Wallpaper restore set: $($wp.FullName)"
+              } else { Write-Host "Saved wallpaper abhi nahi hai, skip" }
+          } catch { Write-Host "Wallpaper restore fail: $_" }
+          exit 0
+
+      - name: Install Apps (VS Code, Antigravity, Codex, ChatGPT)
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          # VS Code + Antigravity (Chocolatey runner par pehle se hai)
+          foreach ($pkg in "vscode", "antigravity") {
+              Write-Host "=== Installing $pkg ==="
+              choco install $pkg -y --no-progress
+              Write-Host "$pkg exit code: $LASTEXITCODE"
+          }
+
+          # Antigravity: choco se na mila ho to winget se (naam badal chuka hai, dono id try)
+          function Run-Winget($wargs, $label) {
+              $j = Start-Job -ScriptBlock { param($a) & winget @a 2>&1 | Out-String } -ArgumentList (,$wargs)
+              if (Wait-Job $j -Timeout 600) { Receive-Job $j | Write-Host } else { Write-Host "$label timeout (10 min), skip"; Stop-Job $j }
+              Remove-Job $j -Force -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+              Write-Host "winget nahi mila, install try kar rahe hain"
+              try {
+                  Install-PackageProvider -Name NuGet -Force | Out-Null
+                  Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers | Out-Null
+                  Repair-WinGetPackageManager -AllUsers
+              } catch { Write-Host "winget install fail: $_" }
+              $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+          }
+          $hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+          Write-Host "winget available: $hasWinget"
+
+          $ag = Get-ChildItem "C:\Program Files", "C:\Users" -Filter "Antigravity.exe" -Recurse -Depth 5 -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ag -and $hasWinget) {
+              foreach ($id in "Google.AntigravityIDE", "Google.Antigravity") {
+                  Write-Host "=== Antigravity via winget: $id ==="
+                  Run-Winget @("install", "--id", $id, "-e", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity") "Antigravity"
+                  $ag = Get-ChildItem "C:\Program Files", "C:\Users" -Filter "Antigravity.exe" -Recurse -Depth 5 -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($ag) { break }
+              }
+          }
+          Write-Host "Antigravity exe: $($ag.FullName)"
+
+          # Codex APP aur ChatGPT APP (Microsoft Store). Codex CLI nahi.
+          $storeApps = @(
+              @{ n = "Codex app";   id = "9PLM9XGG6VKS" },
+              @{ n = "ChatGPT app"; id = "9NT1R1C2HH7J" }
+          )
+          foreach ($a in $storeApps) {
+              Write-Host "=== $($a.n) ($($a.id)) ==="
+              if ($hasWinget) {
+                  Run-Winget @("install", "--id", $a.id, "-s", "msstore", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity") $a.n
+              } else {
+                  Write-Host "winget nahi hai, $($a.n) skip (web shortcut banega)"
+              }
+          }
+
+          # Codex extension VS Code me, RDP user ke profile me (best effort)
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+          try {
+              $sid  = (Get-LocalUser -Name "RDP").SID.Value
+              $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+              if ((Test-Path $code) -and $prof) {
+                  & $code --install-extension openai.chatgpt --extensions-dir "$prof\.vscode\extensions" --force
+                  Write-Host "Codex extension exit code: $LASTEXITCODE"
+              }
+          } catch { Write-Host "Extension install fail: $_" }
+          exit 0
+
+      - name: Register Store Apps for RDP User and Restore App Data
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sid  = (Get-LocalUser -Name "RDP").SID.Value
+          $prof = $null
+          try { $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath } catch {}
+          $pkgs = @(Get-AppxPackage -AllUsers | Where-Object { $_.Name -like "OpenAI.Codex*" -or $_.Name -like "OpenAI.ChatGPT*" })
+          if ($pkgs.Count -eq 0) {
+              Write-Host "Codex/ChatGPT Store apps install nahi hui (Store runner par available nahi). Web shortcuts banenge."
+              exit 0
+          }
+          Write-Host "Mile: $(($pkgs | ForEach-Object { $_.Name }) -join ', ')"
+
+          # Store app runneradmin ke liye install hoti hai, RDP user ke liye register karni padti hai
+          $pw = (Get-Content "$env:TEMP\rdp-pass.txt" -Raw).Trim()
+          $cmds = foreach ($p in $pkgs) { "Add-AppxPackage -DisableDevelopmentMode -Register '$($p.InstallLocation)\AppxManifest.xml'" }
+          $cmds | Set-Content "C:\register-apps.ps1"
+          try {
+              $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\register-apps.ps1"
+              Register-ScheduledTask -TaskName "RegApps" -Action $act -User "RDP" -Password $pw -RunLevel Limited -Force | Out-Null
+              Start-ScheduledTask -TaskName "RegApps"
+              for ($i = 0; $i -lt 36; $i++) {
+                  Start-Sleep -Seconds 5
+                  if ((Get-ScheduledTask -TaskName "RegApps").State -ne "Running") { break }
+              }
+              Write-Host "Register result: $((Get-ScheduledTaskInfo -TaskName 'RegApps').LastTaskResult)"
+              Unregister-ScheduledTask -TaskName "RegApps" -Confirm:$false
+          } catch { Write-Host "Register fail: $_" }
+
+          # Register hone ke BAAD app data restore (taaki permissions sahi rahein)
+          $tar = "$env:SystemRoot\System32\tar.exe"
+          gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern chatgpt.tgz --dir $env:TEMP --clobber 2>$null
+          if ($prof -and (Test-Path "$env:TEMP\chatgpt.tgz")) {
+              & $tar -xzf "$env:TEMP\chatgpt.tgz" -C $prof
+              Write-Host "Codex/ChatGPT app data restore ho gaya."
+          } else {
+              Write-Host "Codex/ChatGPT app data abhi tak save nahi hua."
+          }
+          exit 0
+
+      - name: Create Desktop Shortcuts (sab apps RDP me dikhein)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $desk = "C:\RDPData\Desktop"
+          New-Item -ItemType Directory -Force -Path $desk | Out-Null
+          $ws = New-Object -ComObject WScript.Shell
+
+          # Purane aur duplicate shortcuts hatao (Desktop + Public Desktop + installer wale), phir ek-ek banao
+          $pubDesk = "C:\Users\Public\Desktop"
+          foreach ($d in $desk, $pubDesk) {
+              foreach ($pat in "Visual Studio Code*", "Antigravity*", "Codex*", "ChatGPT*") {
+                  Get-ChildItem $d -Filter "$pat.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          function Make-Shortcut($name, $target, $arguments) {
+              if (-not $target -or -not (Test-Path $target)) { Write-Host "${name}: exe nahi mila, shortcut skip"; return }
+              $lnk = $ws.CreateShortcut("$desk\$name.lnk")
+              $lnk.TargetPath = $target
+              if ($arguments) { $lnk.Arguments = $arguments }
+              $lnk.WorkingDirectory = Split-Path $target
+              $lnk.Save()
+              Write-Host "${name}: shortcut ban gaya"
+          }
+
+          # VS Code
+          Make-Shortcut "Visual Studio Code" "C:\Program Files\Microsoft VS Code\Code.exe" $null
+
+          # Antigravity (kahin bhi install hua ho, dhundh lo)
+          $ag = Get-ChildItem "C:\Program Files", "C:\Program Files (x86)", "C:\ProgramData", "C:\Users" -Filter "Antigravity.exe" -Recurse -Depth 5 -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($ag) { Make-Shortcut "Antigravity" $ag.FullName $null } else { Write-Host "Antigravity exe nahi mila" }
+
+          # Codex app + ChatGPT app: Store app mili to uska shortcut, saath me web backup. Nahi mili to sirf web.
+          $edgeExe = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+          if (-not (Test-Path $edgeExe)) { $edgeExe = "C:\Program Files\Microsoft\Edge\Application\msedge.exe" }
+          $apps = @(
+              @{ n = "Codex";   pat = "OpenAI.Codex*";   web = "https://chatgpt.com/codex" },
+              @{ n = "ChatGPT"; pat = "OpenAI.ChatGPT*"; web = "https://chatgpt.com" }
+          )
+          foreach ($a in $apps) {
+              $pkg = Get-AppxPackage -AllUsers | Where-Object { $_.Name -like $a.pat } | Select-Object -First 1
+              if ($pkg) {
+                  $appId = "App"
+                  try { [xml]$m = Get-Content "$($pkg.InstallLocation)\AppxManifest.xml"; $appId = @($m.Package.Applications.Application)[0].Id } catch {}
+                  Make-Shortcut $a.n "$env:SystemRoot\explorer.exe" "shell:AppsFolder\$($pkg.PackageFamilyName)!$appId"
+              } else {
+                  Make-Shortcut $a.n $edgeExe "--app=$($a.web)"
+              }
+          }
+
+          exit 0
+
+      - name: Install Extra Apps (apps.txt)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $list = "C:\RDPData\apps.txt"
+          if (-not (Test-Path $list)) {
+              @"
+          # Har line me ek app. Ye file RDP ke saath save hoti hai.
+          # choco:7zip                           (Chocolatey package)
+          # https://example.com/setup.exe        (direct download link)
+          # file:Downloads\MyInstaller.exe       (C:\RDPData ke andar ka installer)
+          "@ | Set-Content $list
+          }
+          foreach ($line in Get-Content $list) {
+              $l = $line.Trim()
+              if (-not $l -or $l.StartsWith("#")) { continue }
+              Write-Host "=== $l ==="
+              try {
+                  if ($l -like "choco:*") { choco install $l.Substring(6) -y --no-progress; continue }
+                  if ($l -match '^https?://') {
+                      $ext = if ($l -match '\.msi($|\?)') { ".msi" } else { ".exe" }
+                      $f = "$env:TEMP\" + [guid]::NewGuid().ToString("N") + $ext
+                      Invoke-WebRequest -Uri $l -OutFile $f
+                  } elseif ($l -like "file:*") {
+                      $f = Join-Path "C:\RDPData" $l.Substring(5)
+                  } else {
+                      choco install $l -y --no-progress; continue
+                  }
+                  if (-not (Test-Path $f)) { Write-Host "File nahi mili: $f"; continue }
+                  if ($f -like "*.msi") {
+                      $p = Start-Process msiexec -ArgumentList "/i", "`"$f`"", "/qn", "/norestart", "ALLUSERS=1" -PassThru
+                  } else {
+                      $p = Start-Process $f -ArgumentList "/S", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/ALLUSERS" -PassThru
+                  }
+                  if (-not $p.WaitForExit(300000)) { $p.Kill(); Write-Host "Timeout (5 min): $l" }
+                  else { Write-Host "Done, exit code: $($p.ExitCode)" }
+              } catch { Write-Host "Fail: $l -> $_" }
+          }
+          exit 0
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+          # Tailscale service chalu hone tak wait
+          for ($i = 0; $i -lt 30; $i++) {
+              $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq "Running") { break }
+              Start-Sleep -Seconds 2
+          }
+
+      - name: Establish Tailscale Connection (Login Link)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ts  = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $out = "$env:TEMP\ts_out.txt"
+          $err = "$env:TEMP\ts_err.txt"
+          Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+
+          # Bina auth key ke up chalao, output file me jayega
+          $p = Start-Process $ts -ArgumentList "up","--unattended","--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+            -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+
+          # Login link pakdo
+          $link = $null
+          $text = ""
+          for ($i = 0; $i -lt 60 -and -not $link; $i++) {
+              Start-Sleep -Seconds 2
+              $text = "$(Get-Content $out -Raw -ErrorAction SilentlyContinue)`n$(Get-Content $err -Raw -ErrorAction SilentlyContinue)"
+              if ($text -match 'https://login\.tailscale\.com/\S+') { $link = $Matches[0] }
+              elseif ($p.HasExited) { break }
+          }
+          if (-not $link) {
+              Write-Host "---- tailscale output ----"
+              Write-Host $text
+              Write-Host "exit code: $($p.ExitCode)"
+              exit 1
+          }
+
+          Write-Host "`n=============================="
+          Write-Host " TAILSCALE LOGIN LINK (isse kholo):"
+          Write-Host " $link"
+          Write-Host "==============================`n"
+
+          # Aapke login karne tak wait (10 min)
+          $tsIP = $null
+          for ($i = 0; $i -lt 120 -and -not $tsIP; $i++) {
+              Start-Sleep -Seconds 5
+              $r = (cmd /c "`"$ts`" ip -4 2>nul" | Select-Object -First 1)
+              if ("$r" -match '^\d+\.\d+\.\d+\.\d+$') { $tsIP = "$r".Trim() }
+          }
+          if (-not $tsIP) { Write-Host "Login nahi hua, Tailscale IP nahi mila"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          exit 0
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          $n = 0
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 300
+              $n++
+              if ($n % 2 -eq 0) { & "C:\save-data.ps1" }   # har 10 min me save
+          }
+
+      - name: Final Save (cancel par bhi chalega)
+        if: always()
+        run: |
+          # Browser band karo taaki History file unlock ho jaye
+          $names = "chrome","msedge","firefox","Code","Antigravity"
+          Get-Process -Name $names -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+          Start-Sleep -Seconds 8
+          Get-Process -Name $names -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3
+          if (Test-Path "C:\save-data.ps1") { & "C:\save-data.ps1" }
+          exit 0
